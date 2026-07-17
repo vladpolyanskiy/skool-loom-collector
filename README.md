@@ -1,10 +1,10 @@
 # Skool Loom Collector
 
-A Tampermonkey userscript that automatically walks through Skool classroom lessons and collects Loom and YouTube URLs with their course, section, and lesson relationships.
+Built for people researching how to download videos from Skool courses and communities, this Tampermonkey userscript automatically walks classroom lessons and organizes Loom and YouTube URLs by course, section, and lesson.
 
 It does **not** download videos, press Play, bypass authentication, or bypass DRM. It only records video links from lessons the signed-in account can normally access.
 
-For the story behind the project and a non-technical guide to every button, read [How to Download Videos from Skool Without Opening Every Lesson](BLOG.md).
+Created by [Vlad Polyanskiy](https://vladpoly.com).
 
 ## Install
 
