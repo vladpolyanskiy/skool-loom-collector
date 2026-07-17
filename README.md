@@ -4,7 +4,7 @@ A Tampermonkey userscript that automatically walks through Skool classroom lesso
 
 It does **not** download videos, press Play, bypass authentication, or bypass DRM. It only records video links from lessons the signed-in account can normally access.
 
-For the story behind the project and a non-technical guide to every button, read [I Built a Skool Video Collector for My BJJ Courses](BLOG.md).
+For the story behind the project and a non-technical guide to every button, read [How to Download Videos from Skool Without Opening Every Lesson](BLOG.md).
 
 ## Install
 
