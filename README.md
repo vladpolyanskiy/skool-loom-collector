@@ -6,6 +6,8 @@ It does **not** download videos, press Play, bypass authentication, or bypass DR
 
 Created by [Vlad Polyanskiy](https://vladpoly.com).
 
+Read the full guide: [How to Download Videos from Skool Without Opening Every Lesson](https://vladpoly.com/how-to-download-skool-videos/).
+
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
