@@ -27,9 +27,22 @@ The current scanner incorrectly makes section recognition depend on the Level/We
 - Do not change existing storage keys or delete prior collection data.
 - Only click elements confirmed to be section headers inside structural `set-` containers.
 
+## Active-lesson video providers
+
+The collector will detect both Loom and YouTube only inside the verified active lesson container.
+
+- Loom URLs remain canonical `https://www.loom.com/share/<id>` URLs, preserving `sid` when present.
+- YouTube embed, watch, short, live, `youtu.be`, and privacy-enhanced embed URLs normalize to `https://www.youtube.com/watch?v=<id>`.
+- One shared video collection retains a `provider` field and deduplicates by `provider + id`; existing Loom-only records migrate in memory as provider `loom` without changing the storage key.
+- Lesson results retain legacy `loomIds` and add `youtubeIds`, so old stored data remains readable.
+- TXT, copy, CSV, JSON, hierarchy preview, activity messages, and verified counters include both providers. CSV keeps its existing Loom columns and appends generic provider/video columns.
+- A lesson is marked with the existing internal no-video-compatible status only when neither Loom nor YouTube is found.
+- YouTube metadata comes only from the visible iframe attributes; the collector does not call YouTube APIs, press Play, or inspect recommendations inside the cross-origin player.
+
 ## Verification
 
 - Regression coverage for arbitrary section titles in DOM order.
 - Regression coverage for query-relative `?md=` lesson URLs.
 - Regression coverage preserving the flat Choi Bar fallback.
+- Regression coverage for YouTube normalization, provider-aware deduplication, mixed-provider lesson results, and exports.
 - Full Node test suite and JavaScript syntax check.
