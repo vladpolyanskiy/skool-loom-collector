@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Skool Loom Collector + Status UI
 // @namespace    local.skool.loom.collector
-// @version      3.2.0
+// @version      3.2.1
 // @description  Automatically visits Skool courses and lessons, collecting active-lesson Loom and YouTube URLs without playback or downloads.
 // @author       Local
 // @homepageURL  https://github.com/vladpolyanskiy/skool-loom-collector
@@ -786,12 +786,15 @@
             }
 
             const status = result.status === 'found'
-                ? 'Found'
+                ? ''
                 : result.status === 'no-loom'
                     ? 'No Video'
                     : 'Error';
             const lessonNumber = String(lesson.lessonIndex + 1).padStart(2, '0');
-            lines.push(`  ${lessonNumber}. ${lesson.lessonTitle} — ${status}`);
+            const statusSuffix = status ? ` — ${status}` : '';
+            lines.push(
+                `  ${lessonNumber}. ${lesson.lessonTitle}${statusSuffix}`
+            );
 
             if (result.status === 'found') {
                 resultVideoReferences(result)
@@ -871,7 +874,7 @@
                         lesson.globalLessonIndex,
                         lesson.lessonTitle,
                         lesson.skoolUrl,
-                        result.status || '',
+                        result.status === 'found' ? '' : result.status || '',
                         isLoom ? reference.id : '',
                         isLoom
                             ? (item?.url || (reference.id
@@ -947,9 +950,13 @@
                 course.sections.push(section);
             }
 
+            const exportedStatus = result.status === 'found'
+                ? ''
+                : result.status || '';
+
             section.lessons.push({
                 ...lesson,
-                status: result.status || '',
+                ...(exportedStatus ? { status: exportedStatus } : {}),
                 outcome: result.outcome || '',
                 error: result.error || null,
                 firstSeenAt: result.firstSeenAt || null,
@@ -975,12 +982,23 @@
             });
         });
 
+        const lessonResults = Object.fromEntries(
+            Object.entries(rawResults || {}).map(([key, result]) => {
+                if (result?.status !== 'found') {
+                    return [key, result];
+                }
+
+                const { status: _status, ...withoutStatus } = result;
+                return [key, withoutStatus];
+            })
+        );
+
         return {
             schemaVersion: 4,
             exportedAt,
             courses,
             videos: items,
-            lessonResults: rawResults || {},
+            lessonResults,
             runState: state || defaultState(),
             settings: {
                 ...DEFAULT_SETTINGS,
