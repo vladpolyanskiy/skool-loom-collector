@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Skool Loom Collector + Status UI
 // @namespace    local.skool.loom.collector
-// @version      3.1.0
-// @description  Automatically visits Skool courses and lessons, collecting active-lesson Loom share URLs and metadata without playback or downloads.
+// @version      3.2.0
+// @description  Automatically visits Skool courses and lessons, collecting active-lesson Loom and YouTube URLs without playback or downloads.
 // @author       Local
 // @homepageURL  https://github.com/vladpolyanskiy/skool-loom-collector
 // @supportURL   https://github.com/vladpolyanskiy/skool-loom-collector/issues
@@ -39,9 +39,6 @@
         `\\/(?:share|embed)\\/(${LOOM_ID_PATTERN})(?:$|[/?#])`,
         'i'
     );
-    const SECTION_TITLE_PATTERN =
-        /^Level\s+\d+\s*\|\s*Wk\s+\d+\s*\|/i;
-
     const COURSE_CARD_SELECTOR =
         'div[role="button"][aria-roledescription="sortable"][tabindex="0"]';
     const SECTION_GROUP_SELECTOR =
@@ -50,9 +47,6 @@
         'a[href*="/classroom/"]';
     const MODULE_IDENTIFIER_SELECTOR =
         '[data-rbd-draggable-id^="setModule-"]';
-    const LOOM_IFRAME_SELECTOR =
-        'iframe[src*="loom.com/embed/" i], iframe[data-src*="loom.com/embed/" i]';
-
     const ACTIVE_PHASES = new Set([
         'scanning-catalog',
         'entering-course',
@@ -212,6 +206,116 @@
         }
     }
 
+    function normalizeYouTubeUrl(rawUrl) {
+        if (!rawUrl || typeof rawUrl !== 'string') {
+            return null;
+        }
+
+        let url;
+
+        try {
+            url = new URL(rawUrl, 'https://www.youtube.com');
+        } catch {
+            return null;
+        }
+
+        const host = url.hostname.toLowerCase().replace(/^(?:www\.|m\.)/, '');
+        let id = '';
+
+        if (host === 'youtu.be') {
+            id = url.pathname.split('/').filter(Boolean)[0] || '';
+        } else if (
+            host === 'youtube.com' ||
+            host === 'youtube-nocookie.com'
+        ) {
+            const parts = url.pathname.split('/').filter(Boolean);
+
+            if (url.pathname === '/watch') {
+                id = url.searchParams.get('v') || '';
+            } else if (['embed', 'shorts', 'live'].includes(parts[0])) {
+                id = parts[1] || '';
+            }
+        }
+
+        if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+            return null;
+        }
+
+        return {
+            provider: 'youtube',
+            id,
+            url: `https://www.youtube.com/watch?v=${id}`,
+            embedUrl: `https://www.youtube.com/embed/${id}`
+        };
+    }
+
+    function normalizeVideoUrl(rawUrl) {
+        const loom = normalizeLoomUrl(rawUrl);
+
+        if (loom) {
+            return {
+                provider: 'loom',
+                id: loom.id,
+                url: loom.shareUrl,
+                embedUrl: loom.embedUrl,
+                sid: loom.sid,
+                shareUrl: loom.shareUrl
+            };
+        }
+
+        return normalizeYouTubeUrl(rawUrl);
+    }
+
+    function normalizeVideoProvider(provider) {
+        return cleanText(provider).toLowerCase() === 'youtube'
+            ? 'youtube'
+            : 'loom';
+    }
+
+    function normalizeProviderVideoId(provider, id) {
+        const cleaned = cleanText(id);
+
+        return normalizeVideoProvider(provider) === 'loom'
+            ? cleaned.toLowerCase()
+            : cleaned;
+    }
+
+    function videoRecordKey(provider, id) {
+        const normalizedProvider = normalizeVideoProvider(provider);
+        const normalizedId = normalizeProviderVideoId(
+            normalizedProvider,
+            id
+        );
+
+        return `${normalizedProvider}:${normalizedId}`;
+    }
+
+    function resultVideoReferences(result) {
+        const references = [];
+
+        (Array.isArray(result?.loomIds) ? result.loomIds : [])
+            .forEach((id) => {
+                const normalizedId = normalizeProviderVideoId('loom', id);
+
+                if (normalizedId) {
+                    references.push({ provider: 'loom', id: normalizedId });
+                }
+            });
+        (Array.isArray(result?.youtubeIds) ? result.youtubeIds : [])
+            .forEach((id) => {
+                const normalizedId = normalizeProviderVideoId('youtube', id);
+
+                if (normalizedId) {
+                    references.push({ provider: 'youtube', id: normalizedId });
+                }
+            });
+
+        return [...new Map(references.map((reference) => [
+            videoRecordKey(reference.provider, reference.id),
+            reference
+        ])).values()];
+    }
+
     function normalizeLessonPage(raw) {
         const source = raw && typeof raw === 'object'
             ? raw
@@ -289,24 +393,33 @@
                 continue;
             }
 
-            const normalizedUrl = normalizeLoomUrl(
+            const provider = normalizeVideoProvider(candidate.provider);
+            const fallbackUrl = provider === 'youtube'
+                ? `https://www.youtube.com/watch?v=${candidate.id || ''}`
+                : `https://www.loom.com/share/${candidate.id || ''}`;
+            const normalizedUrl = normalizeVideoUrl(
                 candidate.url ||
                 candidate.embedUrl ||
-                `https://www.loom.com/share/${candidate.id || ''}`
+                fallbackUrl
             );
 
             if (!normalizedUrl) {
                 continue;
             }
 
-            const id = normalizedUrl.id;
+            const id = normalizeProviderVideoId(
+                normalizedUrl.provider,
+                normalizedUrl.id
+            );
+            const key = videoRecordKey(normalizedUrl.provider, id);
             const pages = Array.isArray(candidate.lessonPages)
                 ? candidate.lessonPages.map(normalizeLessonPage)
                 : [];
-            const current = records.get(id);
+            const current = records.get(key);
             const incoming = {
+                provider: normalizedUrl.provider,
                 id,
-                url: normalizedUrl.shareUrl,
+                url: normalizedUrl.url,
                 embedUrl: normalizedUrl.embedUrl,
                 firstSeenAt: candidate.firstSeenAt || fallbackDate,
                 lastSeenAt:
@@ -326,7 +439,7 @@
                         ])
                     ).values()
                 ];
-                records.set(id, incoming);
+                records.set(key, incoming);
                 continue;
             }
 
@@ -341,12 +454,17 @@
                 relationships.set(lessonRelationshipKey(page), page);
             }
 
-            current.url = current.url.includes('?sid=')
-                ? current.url
-                : incoming.url;
-            current.embedUrl = current.embedUrl.includes('?sid=')
-                ? current.embedUrl
-                : incoming.embedUrl;
+            if (current.provider === 'loom') {
+                current.url = current.url.includes('?sid=')
+                    ? current.url
+                    : incoming.url;
+                current.embedUrl = current.embedUrl.includes('?sid=')
+                    ? current.embedUrl
+                    : incoming.embedUrl;
+            } else {
+                current.url = incoming.url;
+                current.embedUrl = incoming.embedUrl;
+            }
             current.firstSeenAt = [
                 current.firstSeenAt,
                 incoming.firstSeenAt
@@ -373,10 +491,10 @@
         now = new Date().toISOString()
     ) {
         const items = normalizeItems(rawItems, now);
-        const normalizedUrl = normalizeLoomUrl(
+        const normalizedUrl = normalizeVideoUrl(
             rawDetection?.shareUrl ||
-            rawDetection?.embedUrl ||
             rawDetection?.url ||
+            rawDetection?.embedUrl ||
             ''
         );
 
@@ -391,19 +509,25 @@
 
         const lesson = normalizeLessonPage(rawLesson);
         const relationship = lessonRelationshipKey(lesson);
-        let record = items.find((item) => item.id === normalizedUrl.id);
+        const provider = normalizedUrl.provider;
+        const id = normalizeProviderVideoId(provider, normalizedUrl.id);
+        const key = videoRecordKey(provider, id);
+        let record = items.find((item) => {
+            return videoRecordKey(item.provider, item.id) === key;
+        });
         const isNewVideo = !record;
 
         if (!record) {
             record = {
-                id: normalizedUrl.id,
-                url: normalizedUrl.shareUrl,
+                provider,
+                id,
+                url: normalizedUrl.url,
                 embedUrl: normalizedUrl.embedUrl,
                 firstSeenAt: now,
                 lastSeenAt: now,
                 metadata: normalizeMetadata(
                     rawDetection?.metadata,
-                    normalizedUrl.id
+                    id
                 ),
                 lessonPages: []
             };
@@ -418,8 +542,12 @@
             record.lessonPages.push(lesson);
         }
 
-        if (!record.url.includes('?sid=') || normalizedUrl.sid) {
-            record.url = normalizedUrl.shareUrl;
+        if (
+            provider !== 'loom' ||
+            !record.url.includes('?sid=') ||
+            normalizedUrl.sid
+        ) {
+            record.url = normalizedUrl.url;
             record.embedUrl = normalizedUrl.embedUrl;
         }
 
@@ -427,7 +555,7 @@
         record.metadata = mergeMetadata(
             record.metadata,
             rawDetection?.metadata,
-            normalizedUrl.id
+            id
         );
 
         return {
@@ -436,6 +564,53 @@
             isNewVideo,
             isNewRelationship
         };
+    }
+
+    function sectionsWithFlatFallback(sections, flatLessons) {
+        if (Array.isArray(sections) && sections.length) {
+            return sections;
+        }
+
+        return Array.isArray(flatLessons) && flatLessons.length
+            ? [{ title: 'Lessons', lessons: flatLessons }]
+            : [];
+    }
+
+    function isInvalidEmptyCourseScan(queue, retryOnly) {
+        return !retryOnly && (!Array.isArray(queue) || queue.length === 0);
+    }
+
+    function isSameCourseLessonHref(href, currentHref) {
+        try {
+            const current = new URL(currentHref);
+            const candidate = new URL(href, current.href);
+
+            return (
+                candidate.origin === current.origin &&
+                candidate.pathname.replace(/\/$/, '') ===
+                    current.pathname.replace(/\/$/, '') &&
+                Boolean(candidate.searchParams.get('md'))
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function sectionDescriptorFromGroup(group) {
+        const headerRow = group?.firstElementChild?.firstElementChild;
+
+        if (!headerRow?.querySelector?.('svg')) {
+            return null;
+        }
+
+        const titledText = [...headerRow.querySelectorAll('[title]')]
+            .map((element) => cleanText(element.getAttribute('title')))
+            .find(Boolean);
+        const title = titledText || cleanText(headerRow.textContent);
+
+        return title
+            ? { group, headerRow, title }
+            : null;
     }
 
     function buildQueueFromSectionData(
@@ -533,30 +708,40 @@
                 })
             : [];
         const allItems = normalizeItems(rawItems);
-        const requestedIds = new Set();
+        const requestedKeys = new Set();
 
         results.forEach((result) => {
             if (result.status !== 'found') {
                 return;
             }
 
-            (Array.isArray(result.loomIds) ? result.loomIds : [])
-                .forEach((id) => {
-                    const normalizedId = cleanText(id).toLowerCase();
-
-                    if (normalizedId) {
-                        requestedIds.add(normalizedId);
-                    }
-                });
+            resultVideoReferences(result).forEach((reference) => {
+                requestedKeys.add(videoRecordKey(
+                    reference.provider,
+                    reference.id
+                ));
+            });
         });
 
-        const items = allItems.filter((item) => requestedIds.has(item.id));
-        const verifiedIds = items.map((item) => item.id);
-        const availableIds = new Set(verifiedIds);
+        const items = allItems.filter((item) => {
+            return requestedKeys.has(videoRecordKey(item.provider, item.id));
+        });
+        const verifiedIds = items.map((item) => {
+            return item.provider === 'loom'
+                ? item.id
+                : videoRecordKey(item.provider, item.id);
+        });
+        const availableKeys = new Set(items.map((item) => {
+            return videoRecordKey(item.provider, item.id);
+        }));
         const lessonCount = results.filter((result) => {
             return result.status === 'found' &&
-                (Array.isArray(result.loomIds) ? result.loomIds : [])
-                    .some((id) => availableIds.has(cleanText(id).toLowerCase()));
+                resultVideoReferences(result).some((reference) => {
+                    return availableKeys.has(videoRecordKey(
+                        reference.provider,
+                        reference.id
+                    ));
+                });
         }).length;
 
         return {
@@ -570,7 +755,10 @@
 
     function buildStructuredText(rawResults, rawItems) {
         const view = buildVerifiedCollection(rawResults, rawItems);
-        const itemMap = new Map(view.items.map((item) => [item.id, item]));
+        const itemMap = new Map(view.items.map((item) => [
+            videoRecordKey(item.provider, item.id),
+            item
+        ]));
         const lines = [];
         let currentCourse = '';
         let currentSection = '';
@@ -600,14 +788,17 @@
             const status = result.status === 'found'
                 ? 'Found'
                 : result.status === 'no-loom'
-                    ? 'No Loom'
+                    ? 'No Video'
                     : 'Error';
             const lessonNumber = String(lesson.lessonIndex + 1).padStart(2, '0');
             lines.push(`  ${lessonNumber}. ${lesson.lessonTitle} — ${status}`);
 
             if (result.status === 'found') {
-                (Array.isArray(result.loomIds) ? result.loomIds : [])
-                    .map((id) => itemMap.get(cleanText(id).toLowerCase()))
+                resultVideoReferences(result)
+                    .map((reference) => itemMap.get(videoRecordKey(
+                        reference.provider,
+                        reference.id
+                    )))
                     .filter(Boolean)
                     .forEach((item) => {
                         lines.push(`      ${item.url}`);
@@ -622,7 +813,10 @@
         const view = buildVerifiedCollection(rawResults, rawItems);
         const results = view.results;
         const items = view.items;
-        const itemMap = new Map(items.map((item) => [item.id, item]));
+        const itemMap = new Map(items.map((item) => [
+            videoRecordKey(item.provider, item.id),
+            item
+        ]));
         const headers = [
             'course_title',
             'section_index',
@@ -639,7 +833,11 @@
             'formats',
             'duration_seconds',
             'first_seen_at',
-            'last_seen_at'
+            'last_seen_at',
+            'video_provider',
+            'video_id',
+            'video_url',
+            'video_title'
         ];
         const rows = [];
 
@@ -650,16 +848,20 @@
             })
             .forEach((result) => {
                 const lesson = normalizeLessonPage(result.lesson);
-                const loomIds = Array.isArray(result.loomIds)
-                    ? [...new Set(result.loomIds.map((id) => {
-                        return cleanText(id).toLowerCase();
-                    }).filter(Boolean))].sort()
-                    : [];
-                const ids = loomIds.length ? loomIds : [''];
+                const references = resultVideoReferences(result);
+                const rowsForLesson = references.length
+                    ? references
+                    : [{ provider: '', id: '' }];
 
-                ids.forEach((id) => {
-                    const item = id ? itemMap.get(id) : null;
+                rowsForLesson.forEach((reference) => {
+                    const item = reference.id
+                        ? itemMap.get(videoRecordKey(
+                            reference.provider,
+                            reference.id
+                        ))
+                        : null;
                     const metadata = item?.metadata || {};
+                    const isLoom = reference.provider === 'loom';
 
                     rows.push([
                         lesson.courseTitle,
@@ -670,18 +872,24 @@
                         lesson.lessonTitle,
                         lesson.skoolUrl,
                         result.status || '',
-                        id,
-                        item?.url || (id
-                            ? `https://www.loom.com/share/${id}`
-                            : ''),
-                        metadata.title || '',
-                        formatQuality(metadata),
-                        Array.isArray(metadata.formats)
+                        isLoom ? reference.id : '',
+                        isLoom
+                            ? (item?.url || (reference.id
+                                ? `https://www.loom.com/share/${reference.id}`
+                                : ''))
+                            : '',
+                        isLoom ? (metadata.title || '') : '',
+                        item ? formatQuality(metadata) : '',
+                        item && Array.isArray(metadata.formats)
                             ? metadata.formats.join('|')
                             : '',
-                        metadata.duration || '',
+                        item?.metadata?.duration || '',
                         item?.firstSeenAt || result.firstSeenAt || '',
-                        item?.lastSeenAt || result.lastSeenAt || ''
+                        item?.lastSeenAt || result.lastSeenAt || '',
+                        reference.provider,
+                        reference.id,
+                        item?.url || '',
+                        metadata.title || ''
                     ]);
                 });
             });
@@ -700,7 +908,10 @@
     }) {
         const view = buildVerifiedCollection(rawResults, rawItems);
         const items = view.items;
-        const itemMap = new Map(items.map((item) => [item.id, item]));
+        const itemMap = new Map(items.map((item) => [
+            videoRecordKey(item.provider, item.id),
+            item
+        ]));
         const results = view.results;
         const courses = [];
         const courseMap = new Map();
@@ -736,10 +947,6 @@
                 course.sections.push(section);
             }
 
-            const loomIds = Array.isArray(result.loomIds)
-                ? result.loomIds
-                : [];
-
             section.lessons.push({
                 ...lesson,
                 status: result.status || '',
@@ -747,8 +954,11 @@
                 error: result.error || null,
                 firstSeenAt: result.firstSeenAt || null,
                 lastSeenAt: result.lastSeenAt || null,
-                videos: loomIds
-                    .map((id) => itemMap.get(cleanText(id).toLowerCase()))
+                videos: resultVideoReferences(result)
+                    .map((reference) => itemMap.get(videoRecordKey(
+                        reference.provider,
+                        reference.id
+                    )))
                     .filter(Boolean)
             });
         }
@@ -766,7 +976,7 @@
         });
 
         return {
-            schemaVersion: 3,
+            schemaVersion: 4,
             exportedAt,
             courses,
             videos: items,
@@ -895,12 +1105,18 @@
 
     const TEST_API = {
         normalizeLoomUrl,
+        normalizeYouTubeUrl,
+        normalizeVideoUrl,
         normalizeMetadata,
         mergeMetadata,
         normalizeLessonPage,
         normalizeItems,
         mergeVideoRecord,
         lessonKey,
+        sectionsWithFlatFallback,
+        isInvalidEmptyCourseScan,
+        isSameCourseLessonHref,
+        sectionDescriptorFromGroup,
         buildQueueFromSectionData,
         compareLessons,
         escapeCsv,
@@ -1245,6 +1461,11 @@
                             return cleanText(id).toLowerCase();
                         }).filter(Boolean))]
                         : [],
+                    youtubeIds: Array.isArray(result.youtubeIds)
+                        ? [...new Set(result.youtubeIds.map((id) => {
+                            return cleanText(id);
+                        }).filter(Boolean))]
+                        : [],
                     error: result.error ? cleanText(result.error) : null,
                     firstSeenAt: result.firstSeenAt || null,
                     lastSeenAt: result.lastSeenAt || null
@@ -1494,16 +1715,7 @@
 
         function getSectionGroups() {
             return [...document.querySelectorAll(SECTION_GROUP_SELECTOR)]
-                .map((group) => {
-                    const heading = [...group.querySelectorAll('[title]')]
-                        .find((element) => {
-                            return SECTION_TITLE_PATTERN.test(
-                                cleanText(element.getAttribute('title'))
-                            );
-                        });
-
-                    return heading ? { group, heading } : null;
-                })
+                .map(sectionDescriptorFromGroup)
                 .filter(Boolean);
         }
 
@@ -1537,7 +1749,6 @@
 
                         return (
                             title &&
-                            !SECTION_TITLE_PATTERN.test(title) &&
                             !element.closest(LESSON_LINK_SELECTOR) &&
                             !groups.some((group) => group.contains(element))
                         );
@@ -1557,48 +1768,42 @@
                 : title;
         }
 
-        function confirmedSectionHeaderRow(group, heading) {
-            const row = group?.firstElementChild?.firstElementChild;
-
-            if (
-                !row ||
-                !row.contains(heading) ||
-                !row.querySelector('svg')
-            ) {
-                return null;
-            }
-
-            return row;
-        }
-
         async function expandCollapsedSections() {
             const entries = getSectionGroups();
 
-            for (const { group, heading } of entries) {
-                if (group.querySelectorAll(LESSON_LINK_SELECTOR).length) {
+            for (const { group, headerRow, title } of entries) {
+                const hasLessonLinks = () => {
+                    return [...group.querySelectorAll(LESSON_LINK_SELECTOR)]
+                        .some((link) => {
+                            return isSameCourseLessonHref(
+                                link.getAttribute('href'),
+                                location.href
+                            );
+                        });
+                };
+
+                if (hasLessonLinks()) {
                     continue;
                 }
 
-                const row = confirmedSectionHeaderRow(group, heading);
+                headerRow.click();
+                const expanded = await waitFor(hasLessonLinks, 1200);
 
-                if (!row) {
-                    addLog(
-                        `Skipped unconfirmed section control: ${cleanText(heading.getAttribute('title'))}`,
-                        'error'
-                    );
-                    continue;
+                if (!expanded) {
+                    addLog(`Section did not expand: ${title}`, 'error');
                 }
-
-                row.click();
-                await waitFor(() => {
-                    return group.querySelectorAll(LESSON_LINK_SELECTOR).length > 0;
-                }, 1200);
             }
         }
 
         function sectionDataFromDom() {
-            return getSectionGroups().map(({ group, heading }) => {
+            const sections = getSectionGroups().map(({ group, title }) => {
                 const lessons = [...group.querySelectorAll(LESSON_LINK_SELECTOR)]
+                    .filter((link) => {
+                        return isSameCourseLessonHref(
+                            link.getAttribute('href'),
+                            location.href
+                        );
+                    })
                     .map((link) => ({
                         title: cleanText(
                             link.querySelector('[title]')?.getAttribute('title') ||
@@ -1612,10 +1817,49 @@
                     }));
 
                 return {
-                    title: cleanText(heading.getAttribute('title')),
+                    title,
                     lessons
                 };
             });
+
+            if (sections.length) {
+                return sections;
+            }
+
+            const seen = new Set();
+            const flatLessons = [...document.querySelectorAll(LESSON_LINK_SELECTOR)]
+                .filter((link) => {
+                    return isSameCourseLessonHref(
+                        link.getAttribute('href'),
+                        location.href
+                    );
+                })
+                .map((link) => {
+                    const href = link.getAttribute('href');
+                    const identifier = link.closest(MODULE_IDENTIFIER_SELECTOR)
+                        ?.getAttribute('data-rbd-draggable-id') || null;
+                    const lessonId = new URL(href, location.href)
+                        .searchParams.get('md');
+                    const dedupeKey = identifier || lessonId || href;
+
+                    if (seen.has(dedupeKey)) {
+                        return null;
+                    }
+
+                    seen.add(dedupeKey);
+
+                    return {
+                        title: cleanText(
+                            link.querySelector('[title]')?.getAttribute('title') ||
+                            link.textContent
+                        ),
+                        href,
+                        identifier
+                    };
+                })
+                .filter((lesson) => lesson?.title);
+
+            return sectionsWithFlatFallback(sections, flatLessons);
         }
 
         function sameLessonUrl(leftRaw, rightRaw) {
@@ -1725,7 +1969,7 @@
                 : null;
         }
 
-        function collectActivePaneLooms(lesson) {
+        function collectActivePaneVideos(lesson) {
             const container = getActiveLessonContainer(lesson);
 
             if (!container) {
@@ -1751,10 +1995,26 @@
                 ['src', 'data-src', 'data-url', 'data-video-url']
                     .forEach((attribute) => {
                         const rawUrl = node.getAttribute(attribute);
-                        const normalized = normalizeLoomUrl(rawUrl || '');
+                        const normalized = normalizeVideoUrl(rawUrl || '');
 
                         if (normalized) {
-                            detections.set(normalized.id, normalized);
+                            const key = videoRecordKey(
+                                normalized.provider,
+                                normalized.id
+                            );
+                            const metadata = normalized.provider === 'youtube'
+                                ? {
+                                    title: cleanText(
+                                        node.getAttribute('title') ||
+                                        node.getAttribute('aria-label')
+                                    ),
+                                    formats: ['YouTube']
+                                }
+                                : {};
+                            detections.set(key, {
+                                ...normalized,
+                                metadata
+                            });
                         }
                     });
             });
@@ -1764,7 +2024,9 @@
 
         function activePaneLoomIds(lesson) {
             return new Set(
-                collectActivePaneLooms(lesson).map((detection) => detection.id)
+                collectActivePaneVideos(lesson)
+                    .filter((detection) => detection.provider === 'loom')
+                    .map((detection) => detection.id)
             );
         }
 
@@ -1969,7 +2231,7 @@
                 courseTitle,
                 courseIndex,
                 sections,
-                location.origin
+                location.href
             );
 
             if (state.retryOnly) {
@@ -1984,7 +2246,6 @@
             }
 
             state.queue = queue;
-            state.queueReady = true;
             state.queueIndex = 0;
             state.currentTarget = null;
 
@@ -1992,12 +2253,16 @@
                 `Detected ${sections.length} sections and ${queue.length} lessons in ${courseTitle}.`
             );
 
-            if (!queue.length) {
-                if (state.retryOnly) {
-                    addLog(`No failed lessons remain in ${courseTitle}.`);
-                } else {
-                    addLog(`No accessible lessons found in ${courseTitle}.`, 'error');
-                }
+            if (isInvalidEmptyCourseScan(queue, state.retryOnly)) {
+                state.queueReady = false;
+                failRun(`No accessible lessons found in ${courseTitle}.`);
+                return;
+            }
+
+            state.queueReady = true;
+
+            if (!queue.length && state.retryOnly) {
+                addLog(`No failed lessons remain in ${courseTitle}.`);
             }
 
             setPhase('running', 'Lesson queue ready.', 'amber');
@@ -2127,11 +2392,11 @@
 
             setPhase(
                 'collecting',
-                `Looking for Loom in ${lesson.lessonTitle}…`,
+                `Looking for video in ${lesson.lessonTitle}…`,
                 'amber'
             );
 
-            const detections = await waitForStableLooms(lesson, generation);
+            const detections = await waitForStableVideos(lesson, generation);
 
             if (!canCommitLessonDetection(state, generation, id)) {
                 return;
@@ -2140,26 +2405,37 @@
             if (!detections.length) {
                 recordLessonResult(lesson, {
                     status: 'no-loom',
-                    outcome: 'no-loom',
+                    outcome: 'no-video',
                     loomIds: [],
+                    youtubeIds: [],
                     error: null
                 });
-                addLog(`No Loom: ${lesson.lessonTitle}`, 'no-loom');
+                addLog(`No Video: ${lesson.lessonTitle}`, 'no-loom');
                 state.tone = 'gray';
             } else {
                 const metadataStore = normalizeMetadataStore(
                     GM_getValue(METADATA_KEY, {})
                 );
                 const loomIds = [];
+                const youtubeIds = [];
                 let addedAnything = false;
 
                 detections.forEach((detection) => {
+                    const detectionMetadata = detection.provider === 'loom'
+                        ? metadataStore[detection.id] || detection.metadata || {}
+                        : detection.metadata || {};
                     const merged = mergeVideoRecord(items, {
                         ...detection,
-                        metadata: metadataStore[detection.id] || {}
+                        metadata: detectionMetadata
                     }, lesson);
                     items = merged.items;
-                    loomIds.push(detection.id);
+
+                    if (detection.provider === 'youtube') {
+                        youtubeIds.push(detection.id);
+                    } else {
+                        loomIds.push(detection.id);
+                    }
+
                     addedAnything = addedAnything ||
                         merged.isNewVideo ||
                         merged.isNewRelationship;
@@ -2170,12 +2446,13 @@
                     status: 'found',
                     outcome: addedAnything ? 'new' : 'already',
                     loomIds,
+                    youtubeIds,
                     error: null
                 });
 
                 if (addedAnything) {
                     addLog(
-                        `Saved ${loomIds.length} Loom URL${loomIds.length === 1 ? '' : 's'}: ${lesson.lessonTitle}`,
+                        `Saved ${detections.length} video URL${detections.length === 1 ? '' : 's'}: ${lesson.lessonTitle}`,
                         'new'
                     );
                     state.tone = 'green';
@@ -2218,7 +2495,7 @@
             }
         }
 
-        async function waitForStableLooms(lesson, generation) {
+        async function waitForStableVideos(lesson, generation) {
             const deadline = Date.now() + settings.lessonTimeoutMs;
 
             while (Date.now() <= deadline) {
@@ -2229,7 +2506,7 @@
                     return [];
                 }
 
-                const first = collectActivePaneLooms(lesson);
+                const first = collectActivePaneVideos(lesson);
 
                 if (first.length) {
                     const continued = await waitMs(300, generation);
@@ -2238,9 +2515,13 @@
                         return [];
                     }
 
-                    const second = collectActivePaneLooms(lesson);
-                    const firstIds = first.map((item) => item.id).sort().join(',');
-                    const secondIds = second.map((item) => item.id).sort().join(',');
+                    const second = collectActivePaneVideos(lesson);
+                    const firstIds = first.map((item) => {
+                        return videoRecordKey(item.provider, item.id);
+                    }).sort().join(',');
+                    const secondIds = second.map((item) => {
+                        return videoRecordKey(item.provider, item.id);
+                    }).sort().join(',');
 
                     if (firstIds && firstIds === secondIds) {
                         return second;
@@ -2267,6 +2548,9 @@
                 outcome: patch.outcome || '',
                 loomIds: Array.isArray(patch.loomIds)
                     ? [...new Set(patch.loomIds)]
+                    : [],
+                youtubeIds: Array.isArray(patch.youtubeIds)
+                    ? [...new Set(patch.youtubeIds)]
                     : [],
                 error: patch.error || null,
                 firstSeenAt: existing?.firstSeenAt || now,
@@ -2546,7 +2830,7 @@
                 courseTitle,
                 findKnownCourseIndex(courseTitle),
                 sections,
-                location.origin
+                location.href
             );
             state.queueReady = true;
             state.queueIndex = currentLesson
@@ -2570,7 +2854,7 @@
             });
 
             if (!retryable.length) {
-                notify('No failed or no-Loom lessons to retry.');
+                notify('No failed or no-video lessons to retry.');
                 return;
             }
 
@@ -2594,7 +2878,7 @@
                 retryOnly: true,
                 startedAt: new Date().toISOString()
             };
-            addLog(`Retrying ${retryable.length} failed or no-Loom lessons.`);
+            addLog(`Retrying ${retryable.length} failed or no-video lessons.`);
             scheduleDrive();
         }
 
@@ -2617,7 +2901,8 @@
             }
 
             const item = items.find((candidate) => {
-                return candidate.id === metadata.id;
+                return candidate.provider === 'loom' &&
+                    candidate.id === metadata.id;
             });
 
             if (!item) {
@@ -2765,7 +3050,7 @@
             [
                 ['found', 'Found'],
                 ['already', 'Already'],
-                ['noLoom', 'No Loom'],
+                ['noLoom', 'No Video'],
                 ['failed', 'Failed']
             ].forEach(([node, label]) => {
                 const cell = createElement('div', 'slc-count');
@@ -2777,7 +3062,7 @@
             const verifiedSummary = createElement(
                 'div',
                 'slc-verified',
-                'Verified Looms: 0 · Legacy excluded: 0'
+                'Verified Videos: 0 · Legacy excluded: 0'
             );
             verifiedSummary.dataset.node = 'verifiedSummary';
 
@@ -2943,7 +3228,7 @@
             const verifiedView = buildVerifiedCollection(results, items);
             setNodeText(
                 ui.verifiedSummary,
-                `Verified Looms: ${verifiedView.items.length} · Legacy excluded: ${verifiedView.legacyCount}`
+                `Verified Videos: ${verifiedView.items.length} · Legacy excluded: ${verifiedView.legacyCount}`
             );
 
             if (ui.timeout && document.activeElement !== ui.timeout) {
@@ -3055,16 +3340,23 @@
                     previousHeading = heading;
                 }
 
-                const item = result.loomIds?.[0]
+                const firstReference = resultVideoReferences(result)[0];
+                const item = firstReference
                     ? items.find((candidate) => {
-                        return candidate.id === result.loomIds[0];
+                        return videoRecordKey(
+                            candidate.provider,
+                            candidate.id
+                        ) === videoRecordKey(
+                            firstReference.provider,
+                            firstReference.id
+                        );
                     })
                     : null;
                 const summary = formatMetadataSummary(item?.metadata);
                 const status = result.status === 'found'
                     ? 'Found'
                     : result.status === 'no-loom'
-                        ? 'No Loom'
+                        ? 'No Video'
                         : 'Error';
                 const index = String(lesson.lessonIndex + 1).padStart(2, '0');
                 const text = `${index}. ${lesson.lessonTitle} — ${status}${summary ? ` — ${summary}` : ''}`;
@@ -3140,7 +3432,7 @@
                 'text/plain'
             );
             notify(
-                `Exported ${view.items.length} verified Loom URLs from ${view.lessonCount} lessons.`
+                `Exported ${view.items.length} verified video URLs from ${view.lessonCount} lessons.`
             );
         }
 
@@ -3179,7 +3471,7 @@
 
             GM_setClipboard(text);
             notify(
-                `Copied ${view.items.length} verified Loom URLs from ${view.lessonCount} lessons.`
+                `Copied ${view.items.length} verified video URLs from ${view.lessonCount} lessons.`
             );
         }
 
@@ -3191,12 +3483,12 @@
                 .join('\n');
 
             if (!text) {
-                notify('No verified Loom URLs to copy yet.');
+                notify('No verified video URLs to copy yet.');
                 return;
             }
 
             GM_setClipboard(text);
-            notify(`Copied ${view.items.length} verified Loom URLs.`);
+            notify(`Copied ${view.items.length} verified video URLs.`);
         }
 
         function notify(message) {
@@ -3324,7 +3616,7 @@
         GM_registerMenuCommand('Rescan current sidebar', rescanSidebar);
         GM_registerMenuCommand('Retry failed lessons', retryFailedLessons);
         GM_registerMenuCommand('Copy structured collection', copyStructuredText);
-        GM_registerMenuCommand('Copy verified Loom URLs only', copyVerifiedUrls);
+        GM_registerMenuCommand('Copy verified video URLs only', copyVerifiedUrls);
         GM_registerMenuCommand('Reset all collection data', armOrConfirmReset);
         GM_registerMenuCommand('Export structured collection TXT', exportTxt);
         GM_registerMenuCommand('Export lesson CSV', exportCsv);
