@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Skool Loom Collector + Status UI
 // @namespace    local.skool.loom.collector
-// @version      3.2.3
+// @version      3.2.4
 // @description  Automatically visits Skool courses and lessons, collecting active-lesson Loom and YouTube URLs without playback or downloads.
 // @author       Local
 // @homepageURL  https://github.com/vladpolyanskiy/skool-loom-collector
@@ -386,6 +386,72 @@
             lesson.lessonIndex,
             lesson.lessonTitle.toLowerCase()
         ].join('::');
+    }
+
+    function stableLessonIdentity(rawLesson) {
+        const lesson = normalizeLessonPage(rawLesson);
+
+        try {
+            const url = new URL(
+                lesson.skoolUrl,
+                'https://www.skool.com'
+            );
+            const moduleId = cleanText(url.searchParams.get('md'));
+
+            if (moduleId) {
+                const host = url.hostname
+                    .toLowerCase()
+                    .replace(/^www\./, '');
+                const path = url.pathname.replace(/\/$/, '');
+
+                return `${host}${path}?md=${moduleId}`;
+            }
+        } catch {
+            // Fall back to the stable sidebar identifier below.
+        }
+
+        return lesson.elementSelectorOrIdentifier
+            ? `element::${lesson.elementSelectorOrIdentifier}`
+            : '';
+    }
+
+    function matchingLessonResultEntries(rawResults, rawLesson) {
+        const source = rawResults && typeof rawResults === 'object'
+            ? rawResults
+            : {};
+        const targetIdentity = stableLessonIdentity(rawLesson);
+        const targetKey = lessonKey(rawLesson);
+
+        return Object.entries(source).filter(([key, result]) => {
+            if (!result?.lesson) {
+                return false;
+            }
+
+            const resultIdentity = stableLessonIdentity(result.lesson);
+
+            if (targetIdentity && resultIdentity) {
+                return targetIdentity === resultIdentity;
+            }
+
+            return key === targetKey || lessonKey(result.lesson) === targetKey;
+        });
+    }
+
+    function filterRetryQueue(rawQueue, rawResults) {
+        const queue = Array.isArray(rawQueue) ? rawQueue : [];
+
+        return queue.filter((lesson) => {
+            return matchingLessonResultEntries(rawResults, lesson)
+                .some(([, result]) => {
+                    return result.status === 'error' ||
+                        result.status === 'no-loom';
+                });
+        });
+    }
+
+    function matchingLessonResultKeys(rawResults, rawLesson) {
+        return matchingLessonResultEntries(rawResults, rawLesson)
+            .map(([key]) => key);
     }
 
     function lessonRelationshipKey(rawLesson) {
@@ -1207,6 +1273,8 @@
         normalizeItems,
         mergeVideoRecord,
         lessonKey,
+        filterRetryQueue,
+        matchingLessonResultKeys,
         sectionsWithFlatFallback,
         isInvalidEmptyCourseScan,
         isSameCourseLessonHref,
@@ -2362,14 +2430,7 @@
             );
 
             if (state.retryOnly) {
-                queue = queue.filter((lesson) => {
-                    const existing = results[lessonKey(lesson)];
-
-                    return existing && (
-                        existing.status === 'error' ||
-                        existing.status === 'no-loom'
-                    );
-                });
+                queue = filterRetryQueue(queue, results);
             }
 
             state.queue = queue;
@@ -2668,7 +2729,20 @@
         function recordLessonResult(lesson, patch) {
             const id = lessonKey(lesson);
             const now = new Date().toISOString();
-            const existing = results[id];
+            const matchingEntries = matchingLessonResultEntries(
+                results,
+                lesson
+            );
+            const matchingKeys = matchingEntries.map(([key]) => key);
+            const firstSeenAt = matchingEntries
+                .map(([, result]) => result.firstSeenAt)
+                .filter(Boolean)
+                .sort()[0] || now;
+
+            matchingKeys.forEach((key) => {
+                delete results[key];
+            });
+
             results[id] = {
                 lesson: normalizeLessonPage(lesson),
                 status: patch.status,
@@ -2680,17 +2754,23 @@
                     ? [...new Set(patch.youtubeIds)]
                     : [],
                 error: patch.error || null,
-                firstSeenAt: existing?.firstSeenAt || now,
+                firstSeenAt,
                 lastSeenAt: now
             };
 
+            const replacedIds = new Set([...matchingKeys, id]);
             state.completedLessonIds = [
-                ...new Set([...state.completedLessonIds, id])
+                ...new Set([
+                    ...state.completedLessonIds.filter((candidate) => {
+                        return !replacedIds.has(candidate);
+                    }),
+                    id
+                ])
             ];
             state.failedLessonIds = state.failedLessonIds
-                .filter((candidate) => candidate !== id);
+                .filter((candidate) => !replacedIds.has(candidate));
             state.noLoomLessonIds = state.noLoomLessonIds
-                .filter((candidate) => candidate !== id);
+                .filter((candidate) => !replacedIds.has(candidate));
 
             if (patch.status === 'error') {
                 state.failedLessonIds.push(id);

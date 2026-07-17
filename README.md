@@ -26,6 +26,8 @@ YouTube detection also supports Skool's lazy poster player, where only a `ytimg.
 
 You can pause, resume, stop, rescan the sidebar, retry failed lessons, or clear old failed/no-video results without deleting found videos. Progress is saved locally through Tampermonkey storage.
 
+**Retry failed** matches lessons by their stable Skool route, so it still works if a newer sidebar scan places an older saved lesson under a different section heading or index.
+
 ## Copy and export
 
 - **Copy structured** copies a readable course → section → lesson → video URL hierarchy.

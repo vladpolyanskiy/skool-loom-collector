@@ -42,7 +42,7 @@ The same data can be copied immediately or downloaded as TXT, CSV, or JSON. Dupl
 - **Resume** continues a paused or browser-interrupted run from the saved progress.
 - **Stop** ends the current run without deleting anything already collected.
 - **Rescan sidebar** reads the open course menu again. Use it if sections or lessons were expanded, loaded late, or changed after the first scan.
-- **Retry failed** runs only lessons previously marked as an error or as having no detected video.
+- **Retry failed** runs only lessons previously marked as an error or as having no detected video. It recognizes the lesson by its stable Skool route even if the course menu now groups that lesson under a different section.
 
 ### Cleanup buttons
 
