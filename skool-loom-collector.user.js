@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Skool Loom Collector + Status UI
 // @namespace    local.skool.loom.collector
-// @version      3.2.1
+// @version      3.2.3
 // @description  Automatically visits Skool courses and lessons, collecting active-lesson Loom and YouTube URLs without playback or downloads.
 // @author       Local
 // @homepageURL  https://github.com/vladpolyanskiy/skool-loom-collector
@@ -211,10 +211,17 @@
             return null;
         }
 
+        const source = cleanText(rawUrl).replace(/&amp;/gi, '&');
+        const cssUrlMatch = source.match(
+            /url\(\s*(['"]?)(https?:\/\/[^'"\s)]+)\1\s*\)/i
+        );
         let url;
 
         try {
-            url = new URL(rawUrl, 'https://www.youtube.com');
+            url = new URL(
+                cssUrlMatch?.[2] || source,
+                'https://www.youtube.com'
+            );
         } catch {
             return null;
         }
@@ -233,6 +240,15 @@
             if (url.pathname === '/watch') {
                 id = url.searchParams.get('v') || '';
             } else if (['embed', 'shorts', 'live'].includes(parts[0])) {
+                id = parts[1] || '';
+            }
+        } else if (
+            host === 'i.ytimg.com' ||
+            host === 'img.youtube.com'
+        ) {
+            const parts = url.pathname.split('/').filter(Boolean);
+
+            if (['vi', 'vi_webp'].includes(parts[0])) {
                 id = parts[1] || '';
             }
         }
@@ -753,6 +769,14 @@
         };
     }
 
+    function formatVerifiedVideoSummary(count) {
+        const total = Number.isFinite(Number(count))
+            ? Math.max(0, Math.trunc(Number(count)))
+            : 0;
+
+        return `Verified Videos: ${total}`;
+    }
+
     function buildStructuredText(rawResults, rawItems) {
         const view = buildVerifiedCollection(rawResults, rawItems);
         const itemMap = new Map(view.items.map((item) => [
@@ -1052,6 +1076,58 @@
         };
     }
 
+    function buildNegativeResultCleanup(rawResults, rawState) {
+        const sourceResults = rawResults && typeof rawResults === 'object'
+            ? rawResults
+            : {};
+        const sourceState = rawState && typeof rawState === 'object'
+            ? rawState
+            : defaultState();
+        const removedResultIds = Object.entries(sourceResults)
+            .filter(([, result]) => {
+                return result?.status === 'no-loom' || result?.status === 'error';
+            })
+            .map(([id]) => id);
+        const trackedNegativeIds = [
+            ...(Array.isArray(sourceState.failedLessonIds)
+                ? sourceState.failedLessonIds
+                : []),
+            ...(Array.isArray(sourceState.noLoomLessonIds)
+                ? sourceState.noLoomLessonIds
+                : [])
+        ];
+        const clearedLessonIds = new Set([
+            ...removedResultIds,
+            ...trackedNegativeIds
+        ]);
+
+        return {
+            results: Object.fromEntries(
+                Object.entries(sourceResults).filter(([id]) => {
+                    return !clearedLessonIds.has(id);
+                })
+            ),
+            state: {
+                ...sourceState,
+                completedLessonIds: (
+                    Array.isArray(sourceState.completedLessonIds)
+                        ? sourceState.completedLessonIds
+                        : []
+                ).filter((id) => !clearedLessonIds.has(id)),
+                failedLessonIds: [],
+                noLoomLessonIds: [],
+                activityLog: (
+                    Array.isArray(sourceState.activityLog)
+                        ? sourceState.activityLog
+                        : []
+                ).filter((entry) => {
+                    return entry?.level !== 'error' && entry?.level !== 'no-loom';
+                })
+            },
+            removedCount: removedResultIds.length
+        };
+    }
+
     function isResetConfirmationActive(deadline, now = Date.now()) {
         const deadlineNumber = Number(deadline);
         const nowNumber = Number(now);
@@ -1141,8 +1217,10 @@
         buildCsv,
         buildJsonExport,
         buildVerifiedCollection,
+        formatVerifiedVideoSummary,
         buildStructuredText,
         buildResetSnapshot,
+        buildNegativeResultCleanup,
         isResetConfirmationActive,
         defaultState,
         restoreState,
@@ -1391,6 +1469,9 @@
         let runnerBusy = false;
         let resetConfirmationTimer = null;
         let resetConfirmationDeadline = 0;
+        let negativeCleanupConfirmationTimer = null;
+        let negativeCleanupConfirmationDeadline = 0;
+        let negativeCleanupPreviousUi = null;
         const pendingWaits = new Map();
 
         GM_setValue(ITEMS_KEY, items);
@@ -1999,43 +2080,71 @@
                 ...container.querySelectorAll([
                     'iframe[src]',
                     'iframe[data-src]',
+                    'img[src]',
+                    'video[poster]',
                     '[data-src]',
                     '[data-url]',
-                    '[data-video-url]'
+                    '[data-video-url]',
+                    '[data-thumbnail]',
+                    '[data-thumbnail-url]'
                 ].join(','))
             ];
+
+            const addDetection = (node, rawUrl) => {
+                const normalized = normalizeVideoUrl(rawUrl || '');
+
+                if (!normalized) {
+                    return;
+                }
+
+                const key = videoRecordKey(
+                    normalized.provider,
+                    normalized.id
+                );
+                const metadata = normalized.provider === 'youtube'
+                    ? {
+                        title: cleanText(
+                            node.getAttribute('title') ||
+                            node.getAttribute('aria-label')
+                        ),
+                        formats: ['YouTube']
+                    }
+                    : {};
+                detections.set(key, {
+                    ...normalized,
+                    metadata
+                });
+            };
 
             nodes.forEach((node) => {
                 if (!elementIsVisible(node)) {
                     return;
                 }
 
-                ['src', 'data-src', 'data-url', 'data-video-url']
+                [
+                    'src',
+                    'data-src',
+                    'data-url',
+                    'data-video-url',
+                    'poster',
+                    'data-thumbnail',
+                    'data-thumbnail-url'
+                ]
                     .forEach((attribute) => {
-                        const rawUrl = node.getAttribute(attribute);
-                        const normalized = normalizeVideoUrl(rawUrl || '');
-
-                        if (normalized) {
-                            const key = videoRecordKey(
-                                normalized.provider,
-                                normalized.id
-                            );
-                            const metadata = normalized.provider === 'youtube'
-                                ? {
-                                    title: cleanText(
-                                        node.getAttribute('title') ||
-                                        node.getAttribute('aria-label')
-                                    ),
-                                    formats: ['YouTube']
-                                }
-                                : {};
-                            detections.set(key, {
-                                ...normalized,
-                                metadata
-                            });
-                        }
+                        addDetection(node, node.getAttribute(attribute));
                     });
             });
+
+            [container, ...container.querySelectorAll('*')]
+                .filter(elementIsVisible)
+                .forEach((node) => {
+                    const backgroundImage = getComputedStyle(node)
+                        .backgroundImage;
+
+                    if (backgroundImage && backgroundImage !== 'none') {
+                        addDetection(node, backgroundImage);
+                    }
+                });
 
             return [...detections.values()];
         }
@@ -2806,6 +2915,79 @@
             saveState();
         }
 
+        function armOrConfirmNegativeResultCleanup() {
+            if (ACTIVE_PHASES.has(state.status)) {
+                notify('Pause or stop collection before clearing saved results.');
+                return;
+            }
+
+            if (isResetConfirmationActive(negativeCleanupConfirmationDeadline)) {
+                performNegativeResultCleanup();
+                return;
+            }
+
+            clearTimeout(negativeCleanupConfirmationTimer);
+            negativeCleanupPreviousUi = {
+                tone: state.tone,
+                message: state.message
+            };
+            negativeCleanupConfirmationDeadline = Date.now() + 10000;
+            state.tone = 'red';
+            state.message = 'Click Confirm clear within 10 seconds to remove saved errors and no-video results.';
+            saveState();
+            negativeCleanupConfirmationTimer = setTimeout(() => {
+                cancelNegativeResultCleanup();
+            }, 10050);
+        }
+
+        function cancelNegativeResultCleanup() {
+            clearTimeout(negativeCleanupConfirmationTimer);
+            negativeCleanupConfirmationTimer = null;
+            negativeCleanupConfirmationDeadline = 0;
+
+            if (negativeCleanupPreviousUi) {
+                state.tone = negativeCleanupPreviousUi.tone;
+                state.message = negativeCleanupPreviousUi.message;
+            }
+
+            negativeCleanupPreviousUi = null;
+            saveState();
+        }
+
+        function performNegativeResultCleanup() {
+            if (!isResetConfirmationActive(negativeCleanupConfirmationDeadline)) {
+                armOrConfirmNegativeResultCleanup();
+                return;
+            }
+
+            clearTimeout(negativeCleanupConfirmationTimer);
+            negativeCleanupConfirmationTimer = null;
+            negativeCleanupConfirmationDeadline = 0;
+            negativeCleanupPreviousUi = null;
+
+            const snapshot = buildNegativeResultCleanup(results, state);
+            results = snapshot.results;
+            state = snapshot.state;
+
+            if (state.status === 'error') {
+                state.status = 'idle';
+                state.interruptedStatus = null;
+                state.currentTarget = null;
+            }
+
+            state.tone = state.status === 'completed'
+                ? 'black'
+                : state.status === 'paused' || state.status === 'awaiting-resume'
+                    ? 'purple'
+                    : 'gray';
+            state.message = snapshot.removedCount
+                ? `Cleared ${snapshot.removedCount} saved failed/no-video lesson result${snapshot.removedCount === 1 ? '' : 's'}.`
+                : 'No saved failed or no-video lesson results were found.';
+
+            GM_setValue(RESULTS_KEY, results);
+            addLog(state.message, 'info');
+        }
+
         function failRun(message) {
             state.routeGeneration += 1;
             cancelPendingWaits();
@@ -3044,6 +3226,7 @@
                 actionButton('Resume', 'resume'),
                 actionButton('Stop', 'stop', 'warn'),
                 actionButton('Reset collection', 'reset', 'warn'),
+                actionButton('Clear failed/no-video', 'clear-negative', 'warn'),
                 actionButton('Rescan sidebar', 'rescan'),
                 actionButton('Retry failed', 'retry')
             );
@@ -3080,7 +3263,7 @@
             const verifiedSummary = createElement(
                 'div',
                 'slc-verified',
-                'Verified Videos: 0 · Legacy excluded: 0'
+                formatVerifiedVideoSummary(0)
             );
             verifiedSummary.dataset.node = 'verifiedSummary';
 
@@ -3167,6 +3350,7 @@
                 resume: resumeRun,
                 stop: stopRun,
                 reset: armOrConfirmReset,
+                'clear-negative': armOrConfirmNegativeResultCleanup,
                 rescan: rescanSidebar,
                 retry: retryFailedLessons,
                 'copy-structured': copyStructuredText,
@@ -3246,7 +3430,7 @@
             const verifiedView = buildVerifiedCollection(results, items);
             setNodeText(
                 ui.verifiedSummary,
-                `Verified Videos: ${verifiedView.items.length} · Legacy excluded: ${verifiedView.legacyCount}`
+                formatVerifiedVideoSummary(verifiedView.items.length)
             );
 
             if (ui.timeout && document.activeElement !== ui.timeout) {
@@ -3263,11 +3447,17 @@
             ui.buttons.stop.disabled = !active && state.status !== 'paused';
             ui.buttons['start-current'].disabled = !isCoursePage() || active;
             ui.buttons['start-all'].disabled = active;
+            ui.buttons['clear-negative'].disabled = active;
             ui.buttons.reset.textContent = isResetConfirmationActive(
                 resetConfirmationDeadline
             )
                 ? 'Confirm reset'
                 : 'Reset collection';
+            ui.buttons['clear-negative'].textContent = isResetConfirmationActive(
+                negativeCleanupConfirmationDeadline
+            )
+                ? 'Confirm clear'
+                : 'Clear failed/no-video';
             renderHierarchy();
             renderLog();
         }
